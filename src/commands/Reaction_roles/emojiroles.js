@@ -11,6 +11,9 @@ import {
     getEmojiRoleConfig,
     listEmojiRoleConfigs,
     deleteEmojiRoleConfig,
+    removeBotReactions,
+    restoreBotReactions,
+    setEmojiRolesDisabled,
 } from '../../services/emojiRoleService.js';
 
 const MAX_SLOTS = 6;
@@ -47,6 +50,21 @@ function buildData() {
         .setName('remove')
         .setDescription('Stop managing a message (removes the setup and the bot\'s own reactions)')
         .addStringOption((o) => o.setName('message_link').setDescription('Link to the message').setRequired(true)));
+
+    builder.addSubcommand((sub) => sub
+        .setName('disable')
+        .setDescription('Pause emoji roles and take the bot\'s reactions off (setup is kept)')
+        .addStringOption((o) => o.setName('message_link').setDescription('One message (leave empty = every message in this server)')));
+
+    builder.addSubcommand((sub) => sub
+        .setName('enable')
+        .setDescription('Resume paused emoji roles and put the bot\'s reactions back')
+        .addStringOption((o) => o.setName('message_link').setDescription('One message (leave empty = every message in this server)')));
+
+    builder.addSubcommand((sub) => sub
+        .setName('delete-all')
+        .setDescription('Delete EVERY emoji role setup in this server and the bot\'s reactions')
+        .addBooleanOption((o) => o.setName('confirm').setDescription('Set to True to confirm').setRequired(true)));
 
     return builder;
 }
@@ -205,7 +223,8 @@ async function handleList(interaction) {
             const holders = entry.limit && role ? await countRoleHolders(interaction.guild, role) : null;
             lines.push(describeEntry(entry, role ? `${role}` : '*(deleted role)*', holders));
         }
-        blocks.push(`https://discord.com/channels/${config.guildId}/${config.channelId}/${config.messageId}\n${lines.join('\n')}`);
+        const status = config.disabled ? ' — ⏸️ **paused**' : '';
+        blocks.push(`https://discord.com/channels/${config.guildId}/${config.channelId}/${config.messageId}${status}\n${lines.join('\n')}`);
     }
     const extra = configs.length > 10 ? `\n\n…and ${configs.length - 10} more.` : '';
     await InteractionHelper.safeEditReply(interaction, {
@@ -215,23 +234,15 @@ async function handleList(interaction) {
 
 async function handleRemove(interaction) {
     if (!(await InteractionHelper.safeDefer(interaction))) return;
-    const { channelId, messageId } = parseMessageLink(interaction, interaction.options.getString('message_link'));
+    const { messageId } = parseMessageLink(interaction, interaction.options.getString('message_link'));
 
-    const removed = await deleteEmojiRoleConfig(interaction.client, interaction.guildId, messageId);
-    if (!removed) {
+    const config = await getEmojiRoleConfig(interaction.client, interaction.guildId, messageId);
+    if (!config) {
         throw createError('Not configured', ErrorTypes.VALIDATION, 'That message doesn\'t have emoji roles set up.');
     }
 
-    // Best effort: take the bot's own reactions off the message.
-    try {
-        const channel = await interaction.guild.channels.fetch(channelId);
-        const message = await channel.messages.fetch(messageId);
-        for (const reaction of message.reactions.cache.values()) {
-            if (reaction.me) await reaction.users.remove(interaction.client.user.id).catch(() => {});
-        }
-    } catch {
-        // message or channel may be gone; the setup is already removed
-    }
+    await deleteEmojiRoleConfig(interaction.client, interaction.guildId, messageId);
+    await removeBotReactions(interaction.client, config); // best effort; the setup is already gone
 
     logger.info(`Emoji roles removed from message ${messageId} in guild ${interaction.guildId} by ${interaction.user.tag}`);
     await InteractionHelper.safeEditReply(interaction, {
@@ -239,8 +250,87 @@ async function handleRemove(interaction) {
     });
 }
 
+/** Resolve "one message" (link given) or "every message in this server" (no link). */
+async function resolveTargets(interaction) {
+    const link = interaction.options.getString('message_link');
+    if (link) {
+        const { messageId } = parseMessageLink(interaction, link);
+        const config = await getEmojiRoleConfig(interaction.client, interaction.guildId, messageId);
+        if (!config) {
+            throw createError('Not configured', ErrorTypes.VALIDATION, 'That message doesn\'t have emoji roles set up.');
+        }
+        return { configs: [config], scope: 'that message' };
+    }
+    return { configs: await listEmojiRoleConfigs(interaction.client, interaction.guildId), scope: 'every message in this server' };
+}
+
+async function handleToggle(interaction, disable) {
+    if (!(await InteractionHelper.safeDefer(interaction))) return;
+    const { configs, scope } = await resolveTargets(interaction);
+
+    if (!configs.length) {
+        return InteractionHelper.safeEditReply(interaction, {
+            embeds: [infoEmbed('Emoji roles', 'Nothing is set up yet. Use `/emojiroles setup` with a message link.')],
+        });
+    }
+
+    let touched = 0;
+    let problems = 0;
+    for (const config of configs) {
+        const updated = await setEmojiRolesDisabled(interaction.client, interaction.guildId, config.messageId, disable);
+        if (!updated) continue;
+        touched++;
+        const result = disable
+            ? await removeBotReactions(interaction.client, updated)
+            : await restoreBotReactions(interaction.client, updated);
+        problems += result.failed;
+    }
+
+    logger.info(`Emoji roles ${disable ? 'paused' : 'resumed'} for ${touched} message(s) in guild ${interaction.guildId} by ${interaction.user.tag}`);
+
+    const note = problems
+        ? `\n\n⚠️ ${problems} reaction${problems === 1 ? '' : 's'} couldn't be ${disable ? 'removed' : 'added'} (missing permissions, or the message is gone). Check that I can add reactions and manage messages there.`
+        : '';
+    const body = disable
+        ? `Paused **${touched}** message${touched === 1 ? '' : 's'} (${scope}). Reactions no longer give or remove roles, and my reactions are off the message${touched === 1 ? '' : 's'}. Nothing was deleted. Use \`/emojiroles enable\` to turn it back on.`
+        : `Resumed **${touched}** message${touched === 1 ? '' : 's'} (${scope}). Reactions give and remove roles again, and my reactions are back on any emoji nobody is using yet.`;
+    await InteractionHelper.safeEditReply(interaction, {
+        embeds: [successEmbed(disable ? 'Emoji roles paused' : 'Emoji roles resumed', body + note)],
+    });
+}
+
+async function handleDeleteAll(interaction) {
+    if (!(await InteractionHelper.safeDefer(interaction))) return;
+
+    if (!interaction.options.getBoolean('confirm')) {
+        throw createError('Not confirmed', ErrorTypes.VALIDATION,
+            'Nothing was deleted. Run the command again with **confirm** set to **True** to delete every emoji role setup in this server.');
+    }
+
+    const configs = await listEmojiRoleConfigs(interaction.client, interaction.guildId);
+    if (!configs.length) {
+        return InteractionHelper.safeEditReply(interaction, {
+            embeds: [infoEmbed('Emoji roles', 'Nothing to delete. No emoji roles are set up.')],
+        });
+    }
+
+    let problems = 0;
+    for (const config of configs) {
+        await deleteEmojiRoleConfig(interaction.client, interaction.guildId, config.messageId);
+        problems += (await removeBotReactions(interaction.client, config)).failed;
+    }
+
+    logger.info(`Deleted all ${configs.length} emoji role setup(s) in guild ${interaction.guildId} by ${interaction.user.tag}`);
+    const note = problems ? `\n\n⚠️ ${problems} of my reactions couldn't be removed (missing permissions, or the message is gone).` : '';
+    await InteractionHelper.safeEditReply(interaction, {
+        embeds: [successEmbed('All emoji roles deleted',
+            `Removed **${configs.length}** setup${configs.length === 1 ? '' : 's'} and took my reactions off those messages. Members keep the roles they already have.${note}`)],
+    });
+}
+
 export default {
     data: buildData(),
+    slashOnly: true, // never runnable through the ! prefix
 
     async execute(interaction) {
         // Discord's default-permission setting only controls who SEES the command (server admins can
@@ -257,5 +347,8 @@ export default {
         if (subcommand === 'setup') return handleSetup(interaction);
         if (subcommand === 'list') return handleList(interaction);
         if (subcommand === 'remove') return handleRemove(interaction);
+        if (subcommand === 'disable') return handleToggle(interaction, true);
+        if (subcommand === 'enable') return handleToggle(interaction, false);
+        if (subcommand === 'delete-all') return handleDeleteAll(interaction);
     },
 };
