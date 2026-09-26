@@ -245,9 +245,12 @@ export default {
     async execute(interaction) {
         // Discord's default-permission setting only controls who SEES the command (server admins can
         // override it), so the real permission check happens here.
-        if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageRoles)) {
-            throw createError('Missing Manage Roles', ErrorTypes.PERMISSION,
-                'You need the **Manage Roles** permission to use this command.');
+        // Allowed: server Administrators, or anyone with Manage Roles.
+        const perms = interaction.memberPermissions;
+        const allowed = perms?.has(PermissionFlagsBits.Administrator) || perms?.has(PermissionFlagsBits.ManageRoles);
+        if (!allowed) {
+            throw createError('Missing permission', ErrorTypes.PERMISSION,
+                'You need the **Administrator** or **Manage Roles** permission to use this command.');
         }
 
         const subcommand = interaction.options.getSubcommand();
