@@ -20,7 +20,7 @@ function buildData() {
     const builder = new SlashCommandBuilder()
         .setName('emojiroles')
         .setDescription('Emoji reaction roles on an existing message (with optional role capacity)')
-        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator);
+        .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles);
 
     builder.addSubcommand((sub) => {
         sub.setName('setup')
@@ -243,6 +243,13 @@ export default {
     data: buildData(),
 
     async execute(interaction) {
+        // Discord's default-permission setting only controls who SEES the command (server admins can
+        // override it), so the real permission check happens here.
+        if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageRoles)) {
+            throw createError('Missing Manage Roles', ErrorTypes.PERMISSION,
+                'You need the **Manage Roles** permission to use this command.');
+        }
+
         const subcommand = interaction.options.getSubcommand();
         if (subcommand === 'setup') return handleSetup(interaction);
         if (subcommand === 'list') return handleList(interaction);
