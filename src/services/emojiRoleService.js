@@ -146,19 +146,35 @@ function noteRevoke(roleId, userId) {
     pendingGrants.get(roleId)?.delete(userId);
 }
 
-/** Number of members currently holding the role (plus grants still in flight). */
+/**
+ * Number of members currently holding the role (plus grants still in flight).
+ * If the member list can't be fully loaded this THROWS, so callers treat the role as full
+ * instead of trusting a partial count.
+ */
 export async function countRoleHolders(guild, role) {
     if (guild.members.cache.size < guild.memberCount) {
-        try {
-            await guild.members.fetch();
-        } catch (error) {
-            logger.warn(`Could not fetch full member list for guild ${guild.id}; counting cached members only:`, error.message);
-        }
+        await guild.members.fetch();
     }
     const ids = new Set(role.members.keys());
     const pending = pendingGrants.get(role.id);
     if (pending) for (const id of pending) ids.add(id);
     return ids.size;
+}
+
+/** Load the full member list at startup for servers that use capped roles, so the first reaction is instant. */
+export async function warmCapacityCaches(client) {
+    for (const guild of client.guilds.cache.values()) {
+        try {
+            const configs = Object.values(await loadGuild(client, guild.id));
+            const hasCap = configs.some((c) => c.entries?.some((e) => e.limit));
+            if (hasCap && guild.members.cache.size < guild.memberCount) {
+                await guild.members.fetch();
+                logger.info(`Loaded ${guild.members.cache.size} members for capped emoji roles in guild ${guild.id}`);
+            }
+        } catch (error) {
+            logger.warn(`Could not pre-load members for guild ${guild.id}:`, error.message);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -192,15 +208,29 @@ async function findEntry(client, data) {
     return { config, entry, guild, member, role };
 }
 
+/** Remove one user's reaction. Returns true if it was removed. Uses one direct API call for speed. */
 async function removeUserReaction(client, data) {
+    const emoji = data.emoji?.id
+        ? `${data.emoji.name ?? '_'}:${data.emoji.id}`
+        : encodeURIComponent(data.emoji?.name ?? '');
+
+    try {
+        await client.rest.delete(`/channels/${data.channel_id}/messages/${data.message_id}/reactions/${emoji}/${data.user_id}`);
+        return true;
+    } catch (directError) {
+        logger.warn(`Direct reaction removal failed for user ${data.user_id} on message ${data.message_id}: ${directError.message}; trying fallback`);
+    }
+
     try {
         const channel = client.channels.cache.get(data.channel_id) ?? await client.channels.fetch(data.channel_id);
         const message = await channel.messages.fetch(data.message_id);
         const key = emojiKey(data.emoji);
         const reaction = message.reactions.cache.find((r) => emojiKey(r.emoji) === key);
         if (reaction) await reaction.users.remove(data.user_id);
+        return true;
     } catch (error) {
-        logger.warn(`Could not remove reaction from user ${data.user_id} on message ${data.message_id} (does the bot have Manage Messages there?):`, error.message);
+        logger.error(`Could not remove reaction from user ${data.user_id} on message ${data.message_id} (does the bot have Manage Messages there?):`, error.message);
+        return false;
     }
 }
 
@@ -222,8 +252,16 @@ export async function handleReactionAdd(client, data) {
         if (member.roles.cache.has(role.id)) return;
 
         if (entry.limit) {
-            const holders = await countRoleHolders(guild, role);
-            if (holders >= entry.limit) {
+            // Fail closed: if we can't prove there is room, the role is treated as full.
+            let full = true;
+            let holders = '?';
+            try {
+                holders = await countRoleHolders(guild, role);
+                full = holders >= entry.limit;
+            } catch (error) {
+                logger.error(`Could not count holders of role ${role.id} in guild ${guild.id}; treating it as full:`, error.message);
+            }
+            if (full) {
                 logger.info(`Emoji role ${role.name} is full (${holders}/${entry.limit}); removing reaction from ${member.id}`);
                 await removeUserReaction(client, data);
                 return;
