@@ -1,5 +1,5 @@
-import { SlashCommandBuilder, PermissionFlagsBits } from 'discord.js';
-import { successEmbed, infoEmbed } from '../../utils/embeds.js';
+import { SlashCommandBuilder, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, UserSelectMenuBuilder } from 'discord.js';
+import { successEmbed, infoEmbed, warningEmbed } from '../../utils/embeds.js';
 import { logger } from '../../utils/logger.js';
 import { createError, ErrorTypes } from '../../utils/errorHandler.js';
 import { InteractionHelper } from '../../utils/interactionHelper.js';
@@ -14,6 +14,9 @@ import {
     removeBotReactions,
     restoreBotReactions,
     setEmojiRolesDisabled,
+    updateEntryLimit,
+    listRoleHolders,
+    revokeRoleFromMembers,
 } from '../../services/emojiRoleService.js';
 
 const MAX_SLOTS = 6;
@@ -50,6 +53,13 @@ function buildData() {
         .setName('remove')
         .setDescription('Stop managing a message (removes the setup and the bot\'s own reactions)')
         .addStringOption((o) => o.setName('message_link').setDescription('Link to the message').setRequired(true)));
+
+    builder.addSubcommand((sub) => sub
+        .setName('limit')
+        .setDescription('Change how many members can hold a role through one emoji')
+        .addStringOption((o) => o.setName('message_link').setDescription('Link to the message').setRequired(true))
+        .addStringOption((o) => o.setName('emoji').setDescription('Which emoji on that message').setRequired(true))
+        .addIntegerOption((o) => o.setName('limit').setDescription('New capacity (leave empty = unlimited)').setMinValue(1).setMaxValue(100000)));
 
     builder.addSubcommand((sub) => sub
         .setName('disable')
@@ -328,6 +338,208 @@ async function handleDeleteAll(interaction) {
     });
 }
 
+const KEEP_OR_REMOVE_MS = 120_000;
+const PICK_MS = 180_000;
+
+function shuffle(list) {
+    const copy = [...list];
+    for (let i = copy.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [copy[i], copy[j]] = [copy[j], copy[i]];
+    }
+    return copy;
+}
+
+function mentionList(members, max = 40) {
+    const shown = members.slice(0, max).map((m) => `<@${m.id}>`).join(' ');
+    return members.length > max ? `${shown} …and ${members.length - max} more` : shown;
+}
+
+async function handleLimit(interaction) {
+    if (!(await InteractionHelper.safeDefer(interaction))) return;
+    const { client, guild } = interaction;
+
+    const { messageId } = parseMessageLink(interaction, interaction.options.getString('message_link'));
+    const config = await getEmojiRoleConfig(client, guild.id, messageId);
+    if (!config) {
+        throw createError('Not configured', ErrorTypes.VALIDATION, 'That message doesn\'t have emoji roles set up.');
+    }
+
+    const emoji = parseEmojiInput(interaction.options.getString('emoji'));
+    if (!emoji) {
+        throw createError('Bad emoji', ErrorTypes.VALIDATION, 'That isn\'t a single emoji. Type or paste one of the emoji from that message.');
+    }
+    const entry = config.entries.find((e) => e.emoji === emoji.key);
+    if (!entry) {
+        throw createError('Emoji not on message', ErrorTypes.VALIDATION,
+            `That emoji isn't set up on that message. It has: ${config.entries.map((e) => e.display).join(' ')}`);
+    }
+    const role = guild.roles.cache.get(entry.roleId);
+    if (!role) {
+        throw createError('Role missing', ErrorTypes.VALIDATION, 'The role for that emoji no longer exists.');
+    }
+
+    const newLimit = interaction.options.getInteger('limit') ?? null;
+    const oldLimit = entry.limit ?? null;
+    const label = (value) => (value ? `**${value}**` : '**unlimited**');
+    const header = `${entry.display} ${role}: capacity ${label(oldLimit)} → ${label(newLimit)}.`;
+
+    if (newLimit === oldLimit) {
+        return InteractionHelper.safeEditReply(interaction, {
+            embeds: [infoEmbed('No change', `${entry.display} ${role} already has capacity ${label(oldLimit)}.`)],
+        });
+    }
+
+    // Save first: from this moment the new cap applies to new reactors, whatever is decided below.
+    const saved = await updateEntryLimit(client, guild.id, messageId, emoji.key, newLimit);
+    if (!saved) {
+        throw createError('Save failed', ErrorTypes.VALIDATION, 'I couldn\'t update that setup. Please try again.');
+    }
+    logger.info(`Emoji role capacity for ${role.id} on message ${messageId} changed ${oldLimit ?? 'unlimited'} -> ${newLimit ?? 'unlimited'} by ${interaction.user.tag}`);
+
+    let holders = null;
+    try {
+        holders = await listRoleHolders(guild, role);
+    } catch (error) {
+        logger.warn(`Could not count holders of role ${role.id} after changing capacity:`, error.message);
+    }
+
+    // Unlimited, still room, or we couldn't count: nothing more to decide.
+    if (newLimit === null || !holders || holders.total <= newLimit) {
+        let detail;
+        if (newLimit === null) detail = 'Anyone who reacts can now get the role.';
+        else if (!holders) detail = 'I couldn\'t count the current members, so I can\'t say how many spots are open. The new capacity is active.';
+        else detail = `**${holders.total}/${newLimit}** taken, **${newLimit - holders.total}** open.`;
+        const raised = newLimit === null || (oldLimit !== null && newLimit > oldLimit) || oldLimit === null;
+        const tail = raised && newLimit !== null
+            ? '\n-# People whose reactions were removed while it was full need to react again.'
+            : '';
+        return InteractionHelper.safeEditReply(interaction, {
+            embeds: [successEmbed('Capacity updated', `${header}\n${detail}${tail}`)],
+        });
+    }
+
+    // Lowered below the number of current holders: ask what to do about the extra people.
+    const over = holders.total - newLimit;
+    const removable = Math.min(over, holders.humans.length);
+    if (removable === 0) {
+        return InteractionHelper.safeEditReply(interaction, {
+            embeds: [successEmbed('Capacity updated', `${header}\n**${holders.total}** hold it, but the extra ${over} are bots, which I can't remove. New reactions are blocked.`)],
+        });
+    }
+
+    const problem = getRoleProblem(guild, role);
+    const id = interaction.id;
+    const choiceRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`emojiroles_keep_${id}`).setLabel('Keep everyone').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`emojiroles_random_${id}`).setLabel(`Remove ${removable} at random`).setStyle(ButtonStyle.Danger).setDisabled(Boolean(problem)),
+        new ButtonBuilder().setCustomId(`emojiroles_choose_${id}`).setLabel('Let me choose who').setStyle(ButtonStyle.Primary).setDisabled(Boolean(problem)),
+    );
+    await InteractionHelper.safeEditReply(interaction, {
+        embeds: [warningEmbed('Capacity is below the current members',
+            `${header}\n**${holders.total}** members already have the role, which is **${over}** over the new capacity. ` +
+            'New reactions are already blocked. What should happen to the extra members?\n\n' +
+            '**Keep everyone**: nobody loses the role.\n' +
+            `**Remove ${removable} at random**: ${removable} random members lose the role and their reaction.\n` +
+            '**Let me choose who**: you pick the members to remove.' +
+            (problem ? `\n\n⚠️ Removing isn't possible right now: ${problem}.` : ''))],
+        components: [choiceRow],
+    });
+
+    const message = await interaction.fetchReply();
+    const onlyMe = (i) => i.user.id === interaction.user.id;
+    const finish = (title, body) => InteractionHelper.safeEditReply(interaction, {
+        embeds: [successEmbed(title, body)],
+        components: [],
+    });
+
+    let click;
+    try {
+        click = await message.awaitMessageComponent({ filter: onlyMe, time: KEEP_OR_REMOVE_MS });
+    } catch {
+        return finish('Capacity updated',
+            `${header}\nNo choice was made in time, so **nobody was removed**. The new capacity is active and new reactions are blocked until enough spots open.`);
+    }
+    await click.deferUpdate().catch(() => {});
+    const choice = click.customId.split('_')[1];
+
+    if (choice === 'keep') {
+        return finish('Capacity updated',
+            `${header}\nEveryone keeps the role (**${holders.total}** members). New reactions are blocked until it drops below **${newLimit}**.`);
+    }
+
+    if (choice === 'random') {
+        const picked = shuffle(holders.humans).slice(0, removable);
+        const result = await revokeRoleFromMembers(client, saved.config, saved.entry, guild, role, picked);
+        const failNote = result.failed ? `\n⚠️ Couldn't remove ${result.failed} (check my permissions and role order).` : '';
+        logger.info(`Randomly removed role ${role.id} from ${result.removed.length} member(s) after lowering capacity, by ${interaction.user.tag}`);
+        return finish('Capacity updated',
+            `${header}\nRemoved the role from **${result.removed.length}** random member${result.removed.length === 1 ? '' : 's'}:\n${mentionList(result.removed)}${failNote}`);
+    }
+
+    // choice === 'choose': let the admin pick, in rounds of up to 25 members.
+    let pool = [...holders.humans];
+    let remaining = removable;
+    const removedAll = [];
+    let failedAll = 0;
+    let skippedAll = 0;
+    let note = '';
+    let ended = 'done';
+
+    while (remaining > 0 && pool.length > 0) {
+        const select = new UserSelectMenuBuilder()
+            .setCustomId(`emojiroles_pick_${id}`)
+            .setPlaceholder(`Pick members to remove (${remaining} more needed)`)
+            .setMinValues(1)
+            .setMaxValues(Math.min(remaining, 25));
+        const stop = new ButtonBuilder().setCustomId(`emojiroles_stop_${id}`).setLabel('Stop here').setStyle(ButtonStyle.Secondary);
+        await InteractionHelper.safeEditReply(interaction, {
+            embeds: [infoEmbed('Choose who loses the role',
+                `${header}\nPick the members who should lose ${role}. **${remaining}** more need to go to reach the capacity. ` +
+                `Members you pick lose the role and their reaction.${note}`)],
+            components: [new ActionRowBuilder().addComponents(select), new ActionRowBuilder().addComponents(stop)],
+        });
+
+        let next;
+        try {
+            next = await message.awaitMessageComponent({ filter: onlyMe, time: PICK_MS });
+        } catch {
+            ended = 'timeout';
+            break;
+        }
+        await next.deferUpdate().catch(() => {});
+        if (next.isButton()) {
+            ended = 'stopped';
+            break;
+        }
+
+        const byId = new Map(pool.map((m) => [m.id, m]));
+        const picked = next.values.map((userId) => byId.get(userId)).filter(Boolean);
+        const skipped = next.values.length - picked.length;
+        skippedAll += skipped;
+        note = skipped ? `\n\n${skipped} of your picks didn't have the role (or are bots) and were skipped.` : '';
+        if (picked.length === 0) continue;
+
+        const result = await revokeRoleFromMembers(client, saved.config, saved.entry, guild, role, picked);
+        removedAll.push(...result.removed);
+        failedAll += result.failed;
+        const goneIds = new Set(result.removed.map((m) => m.id));
+        pool = pool.filter((m) => !goneIds.has(m.id));
+        remaining -= result.removed.length;
+        if (result.failed) note += `\n\n⚠️ Couldn't remove ${result.failed} (check my permissions and role order).`;
+    }
+
+    logger.info(`Admin-chosen removal of role ${role.id} from ${removedAll.length} member(s) after lowering capacity, by ${interaction.user.tag}`);
+    const stillOver = remaining > 0
+        ? `\n**${remaining}** more would need to lose it to reach the capacity. Until then, new reactions stay blocked.`
+        : '';
+    const why = (ended === 'timeout' ? '\n-# Stopped because the selection timed out.' : '')
+        + (skippedAll ? `\n-# ${skippedAll} pick${skippedAll === 1 ? '' : 's'} didn't have the role (or ${skippedAll === 1 ? 'was a bot' : 'were bots'}) and ${skippedAll === 1 ? 'was' : 'were'} skipped.` : '')
+        + (failedAll ? `\n⚠️ Couldn't remove ${failedAll} (check my permissions and role order).` : '');
+    const removedText = removedAll.length ? `Removed the role from **${removedAll.length}**:\n${mentionList(removedAll)}` : 'Nobody was removed.';
+    return finish('Capacity updated', `${header}\n${removedText}${stillOver}${why}`);
+}
+
 export default {
     data: buildData(),
     slashOnly: true, // never runnable through the ! prefix
@@ -347,6 +559,7 @@ export default {
         if (subcommand === 'setup') return handleSetup(interaction);
         if (subcommand === 'list') return handleList(interaction);
         if (subcommand === 'remove') return handleRemove(interaction);
+        if (subcommand === 'limit') return handleLimit(interaction);
         if (subcommand === 'disable') return handleToggle(interaction, true);
         if (subcommand === 'enable') return handleToggle(interaction, false);
         if (subcommand === 'delete-all') return handleDeleteAll(interaction);

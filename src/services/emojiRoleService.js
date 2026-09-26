@@ -296,6 +296,60 @@ export async function restoreBotReactions(client, config) {
     return { added, failed };
 }
 
+/** Change the capacity of one emoji entry. `limit` = null means unlimited. Returns null if not found. */
+export async function updateEntryLimit(client, guildId, messageId, key, limit) {
+    const config = await getEmojiRoleConfig(client, guildId, messageId);
+    if (!config) return null;
+    const index = config.entries.findIndex((e) => e.emoji === key);
+    if (index === -1) return null;
+
+    const previous = config.entries[index].limit ?? null;
+    const entries = config.entries.map((e, i) => (i === index ? { ...e, limit: limit ?? null } : e));
+    const updated = { ...config, entries };
+    await saveEmojiRoleConfig(client, updated);
+    return { config: updated, entry: entries[index], previous };
+}
+
+/**
+ * Who holds the role right now. `total` is the number capacity is measured against (includes
+ * bots and grants still in flight); `humans` are the members that can actually be removed.
+ * Throws if the member list can't be loaded.
+ */
+export async function listRoleHolders(guild, role) {
+    const total = await countRoleHolders(guild, role);
+    const humans = [...role.members.values()].filter((m) => !m.user.bot);
+    return { total, humans };
+}
+
+/**
+ * Take the role (and that emoji reaction) away from specific members, e.g. after lowering a cap.
+ * Returns { removed: GuildMember[], failed: number }.
+ */
+export async function revokeRoleFromMembers(client, config, entry, guild, role, members) {
+    const removed = [];
+    let failed = 0;
+    for (const member of members) {
+        await Mutex.runExclusive(`emojirole:${role.id}`, async () => {
+            try {
+                await member.roles.remove(role, 'Emoji role capacity lowered');
+                noteRevoke(role.id, member.id);
+                removed.push(member);
+            } catch (error) {
+                failed++;
+                logger.warn(`Could not remove role ${role.id} from ${member.id} after lowering capacity:`, error.message);
+                return;
+            }
+            // Also take their reaction off the message so it doesn't look like they still have it (best effort).
+            try {
+                await client.rest.delete(`${reactionsBase(config.channelId, config.messageId)}/${restEmojiFromDisplay(entry.display)}/${member.id}`);
+            } catch {
+                // ignore: the reaction may already be gone
+            }
+        });
+    }
+    return { removed, failed };
+}
+
 /** Pause (disabled = true) or resume (false) a message without deleting its setup. */
 export async function setEmojiRolesDisabled(client, guildId, messageId, disabled) {
     const config = await getEmojiRoleConfig(client, guildId, messageId);
